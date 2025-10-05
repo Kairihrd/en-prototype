@@ -1,0 +1,735 @@
+import React, { useMemo, useState, useEffect, useCallback, createContext, useContext } from "react";
+import { Bell, Check, Clock, MessageSquare, Send, UserPlus, X, ArrowLeft, Home as HomeIcon, Users, User, Settings as SettingsIcon, Heart, Flag, MapPin } from "lucide-react";
+
+/**
+ * EN 完全版 v3.1（フルコード・構文修正）
+ * - セミコロンエラー対策：論理代入演算子（||=）を未使用に変更 / その他細部を厳密化
+ * - ① プロフィール画像アップ
+ * - ② ログイン/新規登録
+ * - ③ ホームから投稿 + 置き投稿
+ * - ④ ハートいいね
+ * - ⑤ 友達→個別チャット
+ * - ⑥ 近くのユーザー（ハニカム）
+ * - ⑦ タブ名「プロフィール」
+ */
+
+/********************* 型 *************************/
+export type UserID = string; export type PostID = string;
+interface UserT { id: UserID; email: string; name: string; handle: string; avatarUrl?: string; bio?: string; isOfficial?: boolean }
+interface CommentT { id: string; authorId: UserID; text: string; createdAt: string }
+interface PostT { id: PostID; authorId: UserID; kind: "post" | "置き投稿"; text: string; createdAt: string; expiresAt?: string; comments: CommentT[]; likes: number; likedBy: UserID[] }
+interface Friendship { a: UserID; b: UserID }
+interface DM { id: string; a: UserID; b: UserID; messages: { id: string; from: UserID; text: string; at: string }[] }
+interface BaseNotif { id: string; createdAt: string; read: boolean }
+interface LikeNotif extends BaseNotif { type: "like"; postId: PostID; fromUserId: UserID; toUserId: UserID }
+interface CommentNotif extends BaseNotif { type: "comment"; postId: PostID; fromUserId: UserID; toUserId: UserID; preview: string }
+interface RequestNotif extends BaseNotif { type: "friend_request"; fromUserId: UserID; toUserId: UserID }
+
+type Notification = LikeNotif | CommentNotif | RequestNotif;
+
+type Radius = 20 | 200 | 2000 | 20000; // m
+
+/********************* ダミーデータ *************************/
+const seedUsers: UserT[] = [
+  { id: "u1", email: "kairi@example.com", name: "Kairi", handle: "@kairihrd0626", bio: "『EN』創業者 / 慶應SFC1年", avatarUrl: "https://i.pravatar.cc/100?img=1" },
+  { id: "u2", email: "haruki@example.com", name: "Haruki", handle: "@haruki", bio: "SFC / Web3", avatarUrl: "https://i.pravatar.cc/100?img=2" },
+  { id: "u3", email: "brand@example.com", name: "Starbucks JP", handle: "@starbucks_j", bio: "スターバックス公式", avatarUrl: "https://i.pravatar.cc/100?img=8", isOfficial: true },
+];
+
+const now = Date.now();
+const addHours = (h:number)=> new Date(now - h*3600*1000).toISOString();
+const addDays = (d:number)=> new Date(now + d*86400*1000).toISOString();
+
+const seedPosts: PostT[] = [
+  { id: "p1", authorId: "u1", kind: "post", text: "熱海の夜景最高！！！ #今旅行中", createdAt: addHours(1), comments: [ { id: "c1", authorId: "u2", text: "楽しそう！", createdAt: addHours(0.8) } ], likes: 2, likedBy: ["u2","u3"] },
+  { id: "p2", authorId: "u2", kind: "置き投稿", text: "みんなで飲み会！ #飲み友集まれ", createdAt: addHours(2), expiresAt: addDays(7), comments: [], likes: 0, likedBy: [] },
+];
+
+/********************* ストア *************************/
+const AppCtx = createContext<ReturnType<typeof useAppModel> | null>(null);
+function useAppModel() {
+  // 認証
+  const [meId, setMeId] = useState<UserID | null>(null);
+  const [authStage, setAuthStage] = useState<"login"|"register"|"app">("login");
+
+  // データ
+  const [users, setUsers] = useState<UserT[]>(seedUsers);
+  const [posts, setPosts] = useState<PostT[]>(seedPosts);
+  const [friendships, setFriendships] = useState<Friendship[]>([]);
+  const [dms, setDms] = useState<DM[]>([]);
+  const [notifications, setNotifications] = useState<Notification[]>([
+    { id: crypto.randomUUID(), type: "friend_request", fromUserId: "u1", toUserId: "u2", createdAt: new Date().toISOString(), read: false },
+  ]);
+
+  // 近くのユーザー（デモ：ログイン後に他ユーザーを数名表示）
+  const nearbyUsers = useMemo(()=> users.filter(u=>u.id!==meId).slice(0,6), [users, meId]);
+
+  const isFriend = useCallback((a: UserID, b: UserID) => {
+    return friendships.some((f) => (f.a === a && f.b === b) || (f.a === b && f.b === a));
+  }, [friendships]);
+
+  const toggleLike = useCallback((postId: PostID, by: UserID) => {
+    setPosts(prev => prev.map(p => {
+      if (p.id !== postId) return p;
+      const has = p.likedBy.includes(by);
+      const likedBy = has ? p.likedBy.filter(x=>x!==by) : [...p.likedBy, by];
+      return { ...p, likedBy, likes: likedBy.length };
+    }));
+    const post = posts.find(p=>p.id===postId);
+    if (post && post.authorId !== by) {
+      setNotifications(prev=>[
+        { id: crypto.randomUUID(), type:"like", postId, fromUserId: by, toUserId: post.authorId, createdAt: new Date().toISOString(), read:false },
+        ...prev,
+      ]);
+    }
+  }, [posts]);
+
+  const addComment = useCallback((postId: PostID, authorId: UserID, text: string) => {
+    setPosts(prev => prev.map(p => p.id===postId? { ...p, comments: [...p.comments, { id: crypto.randomUUID(), authorId, text, createdAt: new Date().toISOString() }] }: p));
+    const post = posts.find(p=>p.id===postId);
+    if (post && post.authorId !== authorId) {
+      setNotifications(prev=>[
+        { id: crypto.randomUUID(), type:"comment", postId, fromUserId: authorId, toUserId: post.authorId, createdAt: new Date().toISOString(), read:false, preview: text.slice(0,20) },
+        ...prev,
+      ]);
+    }
+  }, [posts]);
+
+  const publishPost = useCallback((authorId: UserID, kind: PostT["kind"], text: string) => {
+    const newPost: PostT = { id: crypto.randomUUID(), authorId, kind, text, createdAt: new Date().toISOString(), comments: [], likes: 0, likedBy: [] };
+    setPosts(prev=>[newPost, ...prev]);
+  }, []);
+
+  const publishDropPost = useCallback((authorId: UserID, text: string, radius: Radius) => {
+    const expiresAt = addDays(7);
+    const newPost: PostT = { id: crypto.randomUUID(), authorId, kind: "置き投稿", text, createdAt: new Date().toISOString(), expiresAt, comments: [], likes: 0, likedBy: [] };
+    setPosts(prev=>[newPost, ...prev]);
+  }, []);
+
+  const sendFriendRequest = useCallback((fromUserId: UserID, toUserId: UserID) => {
+    setNotifications(prev=>[
+      { id: crypto.randomUUID(), type:"friend_request", fromUserId, toUserId, createdAt: new Date().toISOString(), read:false },
+      ...prev,
+    ]);
+  }, []);
+
+  const approveFriendRequest = useCallback((req: RequestNotif) => {
+    setFriendships(prev=>[...prev, { a: req.fromUserId, b: req.toUserId }]);
+    setNotifications(prev=>prev.filter(n=>n.id!==req.id));
+  }, []);
+
+  const rejectFriendRequest = useCallback((req: RequestNotif) => {
+    setNotifications(prev=>prev.filter(n=>n.id!==req.id));
+  }, []);
+
+  const markAllToMeRead = useCallback((me: UserID) => {
+    setNotifications(prev=> prev.map(n=> (n as any).toUserId===me? { ...n, read: true }: n));
+  }, []);
+
+  const getDM = useCallback((a: UserID, b: UserID) => {
+    const id = [a,b].sort().join(":");
+    let dm = dms.find(x=>x.id===id);
+    if (!dm) {
+      dm = { id, a, b, messages: [] };
+      setDms(prev=>[...prev, dm]);
+    }
+    return id;
+  }, [dms]);
+
+  const sendDM = useCallback((to: UserID, from: UserID, text: string) => {
+    const id = [to, from].sort().join(":");
+    setDms(prev => prev.map(dm => dm.id===id ? { ...dm, messages: [...dm.messages, { id: crypto.randomUUID(), from, text, at: new Date().toISOString() }] } : dm));
+  }, []);
+
+  return { meId, setMeId, authStage, setAuthStage, users, setUsers, posts, setPosts, friendships, dms, notifications, nearbyUsers, isFriend, toggleLike, addComment, publishPost, publishDropPost, sendFriendRequest, approveFriendRequest, rejectFriendRequest, markAllToMeRead, getDM, sendDM } as const;
+}
+const useApp = () => { const ctx = useContext(AppCtx); if (!ctx) throw new Error("AppCtx missing"); return ctx; };
+
+/********************* ルーター *************************/
+
+type Route =
+  | { name: "home" }
+  | { name: "profile"; userId: UserID }
+  | { name: "friends" }
+  | { name: "settings" }
+  | { name: "post"; postId: PostID }
+  | { name: "chat"; otherId: UserID };
+const RouterCtx = createContext<{ route: Route; navigate: (r: Route) => void } | null>(null);
+const useRouter = () => { const ctx = useContext(RouterCtx); if (!ctx) throw new Error("RouterCtx missing"); return ctx; };
+
+/********************* UI *************************/
+const Card: React.FC<React.PropsWithChildren<{ className?: string }>> = ({ className, children }) => {
+  return <div className={`rounded-2xl bg-white shadow-sm border border-gray-100 ${className ?? ""}`}>{children}</div>;
+};
+const Avatar: React.FC<{ user: UserT; size?: number; onClick?: () => void }> = ({ user, size = 40, onClick }) => {
+  return (
+    <button onClick={onClick} className="flex items-center gap-2 group" title={user.name}>
+      <img src={user.avatarUrl} alt={user.name} style={{ width: size, height: size }} className="rounded-full object-cover ring-2 ring-gray-200 group-hover:ring-black transition" />
+    </button>
+  );
+};
+const SectionTitle: React.FC<{ title: string; right?: React.ReactNode }> = ({ title, right }) => {
+  return (
+    <div className="flex items-center justify-between px-1 md:px-2 py-2">
+      <h2 className="text-lg font-semibold tracking-tight">{title}</h2>
+      <div>{right}</div>
+    </div>
+  );
+};
+const Modal: React.FC<React.PropsWithChildren<{ onClose: ()=>void }>> = ({ onClose, children }) => {
+  return (
+    <div className="fixed inset-0 z-40 flex items-center justify-center">
+      <div className="absolute inset-0 bg-black/30" onClick={onClose} />
+      <Card className="relative w-[90%] max-w-md">{children}</Card>
+    </div>
+  );
+};
+
+/********************* 認証（②） *************************/
+const AuthGate: React.FC = () => {
+  const { authStage } = useApp();
+  if (authStage === "login") return <LoginPage />;
+  if (authStage === "register") return <RegisterPage />;
+  return <AppShell />;
+};
+
+const LoginPage: React.FC = () => {
+  const { users, setAuthStage, setMeId } = useApp();
+  const [email, setEmail] = useState("");
+  const [pw, setPw] = useState("");
+  const submit = () => {
+    const u = users.find(u=>u.email===email.trim());
+    if (!u) { alert("登録がありません。新規登録してください。"); return; }
+    // パスワードチェックはデモ
+    setMeId(u.id);
+    setAuthStage("app");
+  };
+  return (
+    <div className="min-h-screen grid place-items-center bg-gray-50">
+      <Card className="w-[90%] max-w-md p-6">
+        <div className="text-xl font-bold mb-4">EN ログイン</div>
+        <div className="grid gap-3">
+          <input value={email} onChange={e=>setEmail(e.target.value)} placeholder="メールアドレス" className="p-2 rounded-xl border" />
+          <input value={pw} onChange={e=>setPw(e.target.value)} placeholder="パスワード" type="password" className="p-2 rounded-xl border" />
+          <button onClick={submit} className="px-4 py-2 rounded-full bg-black text-white">ログイン</button>
+          <button onClick={()=>setAuthStage("register")} className="px-4 py-2 rounded-full border">新規登録へ</button>
+        </div>
+      </Card>
+    </div>
+  );
+};
+
+const RegisterPage: React.FC = () => {
+  const { users, setUsers, setAuthStage, setMeId } = useApp();
+  const [email, setEmail] = useState("");
+  const [name, setName] = useState("");
+  const [handle, setHandle] = useState("");
+  const [pw, setPw] = useState("");
+  const submit = () => {
+    if(!email || !name || !handle){ alert("必須項目を入力してください"); return; }
+    const id = crypto.randomUUID();
+    const newUser: UserT = { id, email, name, handle, avatarUrl: "https://i.pravatar.cc/100?u="+encodeURIComponent(email) };
+    setUsers([...users, newUser]);
+    setMeId(id);
+    setAuthStage("app");
+  };
+  return (
+    <div className="min-h-screen grid place-items-center bg-gray-50">
+      <Card className="w-[90%] max-w-md p-6">
+        <div className="text-xl font-bold mb-4">EN 新規登録</div>
+        <div className="grid gap-3">
+          <input value={email} onChange={e=>setEmail(e.target.value)} placeholder="メールアドレス" className="p-2 rounded-xl border" />
+          <input value={name} onChange={e=>setName(e.target.value)} placeholder="名前" className="p-2 rounded-xl border" />
+          <input value={handle} onChange={e=>setHandle(e.target.value)} placeholder="ハンドル（@から）" className="p-2 rounded-xl border" />
+          <input value={pw} onChange={e=>setPw(e.target.value)} placeholder="パスワード" type="password" className="p-2 rounded-xl border" />
+          <button onClick={submit} className="px-4 py-2 rounded-full bg-black text-white">登録してはじめる</button>
+          <button onClick={()=>setAuthStage("login")} className="px-4 py-2 rounded-full border">ログインへ戻る</button>
+        </div>
+      </Card>
+    </div>
+  );
+};
+
+/********************* アプリ外殻 *************************/
+const Header: React.FC = () => {
+  return (
+    <div className="sticky top-0 z-10 bg-white/80 backdrop-blur border-b border-gray-100">
+      <div className="max-w-3xl mx-auto flex items-center justify-between px-4 py-3">
+        <div className="text-xl font-bold tracking-wide">EN</div>
+        <div className="opacity-0">.</div>
+      </div>
+    </div>
+  );
+};
+const BottomNav: React.FC = () => {
+  const { route, navigate } = useRouter();
+  const { meId } = useApp();
+  const is = (n:Route["name"]) => route.name===n;
+  return (
+    <nav className="fixed bottom-0 inset-x-0 z-20 border-t border-gray-200 bg-white/90 backdrop-blur">
+      <div className="max-w-3xl mx-auto grid grid-cols-4">
+        <button className={`p-3 flex flex-col items-center gap-1 ${is("home")?"text-black":"text-gray-500"}`} onClick={()=>navigate({name:"home"})}><HomeIcon className="w-6 h-6"/><span className="text-[11px]">ホーム</span></button>
+        <button className={`p-3 flex flex-col items-center gap-1 ${is("friends")?"text-black":"text-gray-500"}`} onClick={()=>navigate({name:"friends"})}><Users className="w-6 h-6"/><span className="text-[11px]">友達</span></button>
+        <button className={`p-3 flex flex-col items-center gap-1 ${is("settings")?"text-black":"text-gray-500"}`} onClick={()=>navigate({name:"settings"})}><SettingsIcon className="w-6 h-6"/><span className="text-[11px]">設定</span></button>
+        <button className={`p-3 flex flex-col items-center gap-1 ${(route.name==="profile")?"text-black":"text-gray-500"}`} onClick={()=>navigate({name:"profile", userId: meId as UserID})}><User className="w-6 h-6"/><span className="text-[11px]">プロフィール</span></button>
+      </div>
+    </nav>
+  );
+};
+const FloatingBell: React.FC = () => {
+  const { notifications, meId } = useApp();
+  const { navigate } = useRouter();
+  const unread = notifications.filter(n=> (n as any).toUserId===meId && !n.read).length;
+  return (
+    <button onClick={()=>navigate({name:"friends"})} title="お知らせ" className="fixed right-3 md:right-6 bottom-24 md:bottom-28 z-30 p-3 rounded-full shadow-lg bg-white border border-gray-200 hover:shadow-xl">
+      <Bell className="w-6 h-6"/>
+      {unread>0 && <span className="absolute -top-1 -right-1 text-xs bg-red-500 text-white rounded-full px-1.5 py-0.5">{unread}</span>}
+    </button>
+  );
+};
+
+const AppShell: React.FC = () => {
+  const { meId } = useApp();
+  if (!meId) return null;
+  return (
+    <div className="min-h-screen bg-gray-50 pb-24">
+      <Header />
+      <main className="max-w-3xl mx-auto p-4"><RouteView /></main>
+      <BottomNav />
+      <FloatingBell />
+    </div>
+  );
+};
+
+/********************* ページ：ホーム *************************/
+const extractTags = (text: string) => Array.from(new Set((text.match(/#[^\s#]+/g) || []).map(t=>t.trim())));
+const Home: React.FC = () => {
+  const { posts, users, toggleLike, addComment, meId, publishPost, publishDropPost } = useApp();
+  const { navigate } = useRouter();
+  const [expanded, setExpanded] = useState<Record<PostID, boolean>>({});
+  const [tagFilter, setTagFilter] = useState<string | null>(null);
+  const filtered = useMemo(()=> tagFilter? posts.filter(p=> p.text.includes(tagFilter)) : posts, [posts, tagFilter]);
+  const [newText, setNewText] = useState("");
+  const onSend = () => { if (!newText.trim()) return; publishPost(meId as UserID, "post", newText.trim()); setNewText(""); };
+
+  // 置き投稿
+  const [showDrop, setShowDrop] = useState(false);
+  const [radius, setRadius] = useState<Radius>(200);
+  const [confirm, setConfirm] = useState(false);
+  const confirmDrop = () => { publishDropPost(meId as UserID, newText.trim()||"（無題）", radius); setNewText(""); setConfirm(false); setShowDrop(false); };
+
+  return (
+    <div className="space-y-3">
+      <SectionTitle title="ホーム" right={tagFilter ? (<button onClick={()=>setTagFilter(null)} className="text-xs underline text-gray-600">{tagFilter} を解除</button>) : <span className="text-xs text-gray-500">#タップで同じ投稿</span>} />
+
+      {filtered.map((p) => {
+        const author = users.find((u) => u.id === p.authorId) as UserT;
+        const liked = p.likedBy.includes(meId as UserID);
+        const tags = extractTags(p.text);
+        const collapsed = !expanded[p.id];
+        const showComments = collapsed ? p.comments.slice(0,1) : p.comments;
+        const remaining = p.expiresAt ? Math.max(0, Math.floor((new Date(p.expiresAt).getTime() - Date.now())/3600_000)) : null;
+        return (
+          <Card key={p.id} className="p-4">
+            <div className="flex gap-3">
+              <Avatar user={author} onClick={() => navigate({ name: "profile", userId: author.id })} />
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-2">
+                  <button className="font-semibold hover:underline truncate" onClick={() => navigate({ name: "profile", userId: author.id })}>{author.name}</button>
+                  <span className="text-xs text-gray-500 truncate">{author.handle}</span>
+                  <div className="ml-auto flex items-center gap-2 text-xs text-gray-500">
+                    {p.kind === "置き投稿" && <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full border"><Flag className="w-3 h-3"/>置き</span>}
+                    <span className="flex items-center gap-1"><Clock className="w-3 h-3" /> {new Date(p.createdAt).toLocaleTimeString()}</span>
+                    {remaining!==null && <span>・残{remaining<24?`${remaining}h`:`${Math.ceil(remaining/24)}d`}</span>}
+                  </div>
+                </div>
+
+                <p className="mt-1 whitespace-pre-wrap break-words">{p.text.split(/(#[^\s#]+)/g).map((seg, i) => seg.match(/^#[^\s#]+$/) ? (<button key={i} className="text-blue-600 hover:underline" onClick={()=>setTagFilter(seg)}>{seg}</button>) : (<span key={i}>{seg}</span>))}</p>
+
+                <div className="flex items-center gap-4 mt-3 text-sm text-gray-600">
+                  <button className={`flex items-center gap-1 hover:text-black ${liked?"text-red-500":""}`} onClick={() => toggleLike(p.id, meId as UserID)}>
+                    <Heart className="w-4 h-4" fill={liked?"currentColor":"none"} /> いいね {p.likes>0 && <span>({p.likes})</span>}
+                  </button>
+                  <button className="flex items-center gap-1 hover:text-black" onClick={() => setExpanded(e=>({ ...e, [p.id]: !e[p.id] }))}><MessageSquare className="w-4 h-4" /> コメント{p.comments.length>0 && <span>({p.comments.length})</span>}</button>
+                </div>
+
+                <div className="mt-2 space-y-1">{showComments.map((c)=>{ const au = users.find((u)=>u.id===c.authorId) as UserT; return (
+                  <div key={c.id} className="flex items-start gap-2 text-sm">
+                    <Avatar user={au} size={28} onClick={()=>navigate({name:"profile", userId: au.id})} />
+                    <div className="bg-gray-50 rounded-xl px-3 py-1.5"><div className="text-xs text-gray-500">{au.name}</div><div>{c.text}</div></div>
+                  </div>
+                ); })}</div>
+                <CommentInput onSend={(txt)=>addComment(p.id, meId as UserID, txt)} />
+                {tags.length>0 && (<div className="mt-2 flex flex-wrap gap-2 text-[11px] text-blue-600">{tags.map((t)=>(<button key={t} onClick={()=>setTagFilter(t)} className="px-2 py-0.5 rounded-full bg-blue-50 border border-blue-100">{t}</button>))}</div>)}
+              </div>
+            </div>
+          </Card>
+        );
+      })}
+
+      {/* コンポーザー（X風） */}
+      <Card className="p-3 sticky bottom-24 bg-white/90 backdrop-blur">
+        <div className="flex items-center gap-2">
+          <input value={newText} onChange={(e)=>setNewText(e.target.value)} placeholder="いまどうしてる？" className="flex-1 p-2 rounded-xl border outline-none" />
+          <button onClick={()=>setShowDrop(true)} className="px-3 py-1.5 rounded-full border text-sm">置き投稿</button>
+          <button onClick={onSend} className="px-3 py-1.5 rounded-full bg-black text-white text-sm flex items-center gap-1"><Send className="w-4 h-4"/>投稿</button>
+        </div>
+      </Card>
+
+      {/* 置き投稿モーダル */}
+      {showDrop && (
+        <Modal onClose={()=>setShowDrop(false)}>
+          <div className="p-4">
+            <div className="text-lg font-semibold mb-2">置き投稿</div>
+            <div className="text-sm text-gray-600 mb-3">半径を選択してください（共有範囲）</div>
+            <RadiusPicker value={radius} onChange={setRadius} />
+            <div className="flex justify-end gap-2 mt-4">
+              <button onClick={()=>setShowDrop(false)} className="px-3 py-1.5 rounded-full border text-sm">キャンセル</button>
+              <button onClick={()=>setConfirm(true)} className="px-3 py-1.5 rounded-full bg-black text-white text-sm">続ける</button>
+            </div>
+          </div>
+        </Modal>
+      )}
+      {/* 確認 */}
+      {confirm && (
+        <Modal onClose={()=>setConfirm(false)}>
+          <div className="p-4">
+            <div className="mb-2">置き投稿を行いますか？</div>
+            <div className="text-sm text-gray-600 mb-3">選択した半径内のユーザーに共有されます。</div>
+            <div className="flex justify-end gap-2">
+              <button onClick={()=>setConfirm(false)} className="px-3 py-1.5 rounded-full border text-sm">いいえ</button>
+              <button onClick={confirmDrop} className="px-3 py-1.5 rounded-full bg-black text-white text-sm">はい</button>
+            </div>
+          </div>
+        </Modal>
+      )}
+    </div>
+  );
+};
+const CommentInput: React.FC<{ onSend: (text: string) => void }> = ({ onSend }) => {
+  const [val, setVal] = useState("");
+  const submit = () => { if(val.trim()){ onSend(val.trim()); setVal(""); } };
+  return (
+    <div className="mt-2 flex items-center gap-2">
+      <input value={val} onChange={(e)=>setVal(e.target.value)} placeholder="コメントを書く" className="flex-1 p-2 rounded-xl border outline-none text-sm" />
+      <button onClick={submit} className="px-3 py-1.5 rounded-full bg-black text-white text-xs flex items-center gap-1"><Send className="w-3 h-3"/>送信</button>
+    </div>
+  );
+};
+const RadiusPicker: React.FC<{ value: Radius; onChange: (r: Radius)=>void }> = ({ value, onChange }) => {
+  const opts: { label: string; v: Radius }[] = [
+    {label:"20m",v:20},
+    {label:"200m",v:200},
+    {label:"2km",v:2000},
+    {label:"20km",v:20000},
+  ];
+  return (
+    <div className="grid grid-cols-4 gap-2">
+      {opts.map(o=> (
+        <button key={o.v} onClick={()=>onChange(o.v)} className={`px-3 py-2 rounded-xl border ${value===o.v?'bg-black text-white border-black':'bg-white'}`}>{o.label}</button>
+      ))}
+    </div>
+  );
+};
+
+/********************* プロフィール *************************/
+const ProfilePage: React.FC<{ userId: UserID }> = ({ userId }) => {
+  const { users, setUsers, meId, isFriend, sendFriendRequest } = useApp();
+  const { navigate } = useRouter();
+  const u = users.find(x=>x.id===userId) as UserT;
+  const isMe = userId===meId;
+  const [editName, setEditName] = useState(u.name);
+  const [editBio, setEditBio] = useState(u.bio ?? "");
+  const onAvatarChange: React.ChangeEventHandler<HTMLInputElement> = (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      const url = String(reader.result);
+      setUsers(prev=>prev.map(x=> x.id===userId? { ...x, avatarUrl: url }: x));
+    };
+    reader.readAsDataURL(file);
+  };
+  const saveProfile = () => {
+    if (!isMe) return;
+    setUsers(prev=>prev.map(x=> x.id===userId? { ...x, name: editName, bio: editBio }: x));
+    alert("プロフィールを更新しました");
+  };
+
+  return (
+    <div className="space-y-3">
+      <div className="flex items-center gap-2 px-1">
+        <button onClick={() => navigate({ name: "home" })} className="p-2 rounded-full hover:bg-gray-50"><ArrowLeft className="w-5 h-5"/></button>
+        <SectionTitle title="プロフィール" />
+      </div>
+      <Card className="p-4">
+        <div className="flex gap-4 items-center">
+          <div className="relative">
+            <img src={u.avatarUrl} className="rounded-full w-20 h-20 object-cover ring-2 ring-gray-200" />
+            {isMe && (
+              <label className="absolute bottom-0 right-0 text-[11px] px-2 py-0.5 rounded-full bg-black text-white cursor-pointer">
+                変更
+                <input type="file" accept="image/*" className="hidden" onChange={onAvatarChange} />
+              </label>
+            )}
+          </div>
+          <div className="flex-1">
+            <div className="text-xl font-semibold">{u.name}</div>
+            <div className="text-sm text-gray-500">{u.handle}</div>
+            <p className="text-sm mt-1 whitespace-pre-wrap">{u.bio}</p>
+          </div>
+          {!isMe && (
+            isFriend(meId as UserID, userId) ? (
+              <span className="text-sm text-gray-500">友達です</span>
+            ) : (
+              <button onClick={() => sendFriendRequest(meId as UserID, userId)} className="flex items-center gap-2 px-4 py-2 rounded-full bg-black text-white text-sm"><UserPlus className="w-4 h-4"/>友達申請</button>
+            )
+          )}
+        </div>
+      </Card>
+
+      {isMe && (
+        <Card className="p-4">
+          <div className="text-sm font-medium mb-2">プロフィール編集</div>
+          <div className="grid gap-2">
+            <input value={editName} onChange={(e)=>setEditName(e.target.value)} className="p-2 rounded-xl border" />
+            <textarea value={editBio} onChange={(e)=>setEditBio(e.target.value)} className="p-2 rounded-xl border" rows={3} />
+            <button onClick={saveProfile} className="px-4 py-2 rounded-full bg-black text-white text-sm w-fit">保存</button>
+          </div>
+        </Card>
+      )}
+
+      <SectionTitle title="投稿" />
+      <UserPosts userId={userId} />
+    </div>
+  );
+};
+const UserPosts: React.FC<{ userId: UserID }> = ({ userId }) => {
+  const { posts, users } = useApp();
+  const { navigate } = useRouter();
+  const list = posts.filter(p=>p.authorId===userId);
+  const user = users.find(u=>u.id===userId) as UserT;
+  return (
+    <div className="grid gap-3">
+      {list.length===0 && <Card className="p-4 text-sm text-gray-500">まだ投稿がありません</Card>}
+      {list.map(p=>(
+        <Card key={p.id} className="p-4">
+          <div className="flex gap-3">
+            <Avatar user={user} onClick={()=>navigate({name:"profile", userId})} />
+            <div className="flex-1">
+              <div className="flex items-center gap-2">
+                <div className="font-semibold">{user.name}</div>
+                <span className="text-xs text-gray-500">{user.handle}</span>
+                <span className="text-[10px] px-2 py-0.5 rounded-full border ml-auto">{p.kind}</span>
+              </div>
+              <p className="mt-1 whitespace-pre-wrap">{p.text}</p>
+            </div>
+          </div>
+        </Card>
+      ))}
+    </div>
+  );
+};
+
+/********************* 友達 + 近く *************************/
+const FriendsPage: React.FC = () => {
+  const { meId, users, friendships, notifications, approveFriendRequest, rejectFriendRequest, markAllToMeRead, nearbyUsers } = useApp();
+  const { navigate } = useRouter();
+  useEffect(()=>{ if(meId) markAllToMeRead(meId); }, [markAllToMeRead, meId]);
+
+  const myFriendIds = friendships.filter(f=>f.a===meId || f.b===meId).map(f=> f.a===meId? f.b: f.a);
+  const friends = users.filter(u=> myFriendIds.includes(u.id));
+  const requestsIn = notifications.filter((n): n is RequestNotif => n.type === "friend_request" && n.toUserId === meId);
+  const toMe = notifications.filter((n) => (n as any).toUserId === meId && n.type !== "friend_request");
+
+  const openChat = (otherId: UserID) => navigate({ name: "chat", otherId });
+
+  return (
+    <div className="space-y-4">
+      <SectionTitle title="友達・お知らせ" right={<span className="text-xs text-gray-500">ベルからも開けます</span>} />
+      {requestsIn.length>0 && (
+        <Card className="p-3">
+          <div className="text-sm font-medium mb-2">友達申請</div>
+          <div className="space-y-2">
+            {requestsIn.map(n=>{ const from = users.find(u=>u.id===n.fromUserId) as UserT; return (
+              <div key={n.id} className="flex items-center gap-3">
+                <Avatar user={from} onClick={()=>openChat(from.id)} />
+                <div className="flex-1">
+                  <div className="text-sm"><span className="font-semibold">{from.name}</span> から友達申請</div>
+                  <div className="text-xs text-gray-500">{new Date(n.createdAt).toLocaleString()}</div>
+                </div>
+                <div className="flex items-center gap-2">
+                  <button onClick={()=>approveFriendRequest(n)} className="px-3 py-1.5 rounded-full bg-black text-white text-sm">許可</button>
+                  <button onClick={()=>rejectFriendRequest(n)} className="px-3 py-1.5 rounded-full border text-sm">無視</button>
+                </div>
+              </div>
+            ); })}
+          </div>
+        </Card>
+      )}
+
+      {toMe.length>0 && (
+        <Card className="p-3">
+          <div className="text-sm font-medium mb-2">アクティビティ</div>
+          <div className="space-y-2">
+            {toMe.map(n=>{ const from = users.find(u=>u.id===(n as any).fromUserId) as UserT; if(n.type==="like") return (
+              <div key={n.id} className="flex items-center gap-3 text-sm"><Heart className="w-4 h-4" /> <span><b>{from.name}</b> があなたの投稿にいいね</span></div>
+            ); if(n.type==="comment") return (
+              <div key={n.id} className="flex items-center gap-3 text-sm"><MessageSquare className="w-4 h-4" /> <span><b>{from.name}</b> がコメント: {(n as CommentNotif).preview}</span></div>
+            ); return null; })}
+          </div>
+        </Card>
+      )}
+
+      <Card className="p-3">
+        <div className="text-sm font-medium mb-2">友達（個人チャットへ）</div>
+        {friends.length===0? (
+          <div className="text-sm text-gray-500">まだ友達がいません。プロフィールから友達申請を。</div>
+        ) : (
+          <div className="space-y-2">
+            {friends.map(f=> (
+              <div key={f.id} className="flex items-center gap-3">
+                <Avatar user={f} onClick={()=>openChat(f.id)} />
+                <div className="flex-1">
+                  <div className="font-semibold text-sm">{f.name}</div>
+                  <div className="text-xs text-gray-500">タップでチャットを開く</div>
+                </div>
+                <button onClick={()=>openChat(f.id)} className="px-3 py-1.5 rounded-full border text-sm">開く</button>
+              </div>
+            ))}
+          </div>
+        )}
+      </Card>
+
+      {/* 近くのユーザー（ハニカム） */}
+      <SectionTitle title="近くにいるユーザー" right={<span className="text-xs text-gray-500 flex items-center gap-1"><MapPin className="w-4 h-4"/>正確な距離は表示しません</span>} />
+      <Honeycomb users={nearbyUsers} onTap={(u)=>openChat(u.id)} onOpenProfile={(u)=>navigate({name:"profile", userId: u.id})} />
+    </div>
+  );
+};
+
+// ハニカム風配置（||= を使わず安全に）
+const Honeycomb: React.FC<{ users: UserT[]; onTap: (u: UserT)=>void; onOpenProfile: (u: UserT)=>void }> = ({ users, onTap, onOpenProfile }) => {
+  const rows: UserT[][] = [];
+  users.forEach((u, i)=>{
+    const r = Math.floor(i/3);
+    if (!rows[r]) rows[r] = [];
+    rows[r].push(u);
+  });
+  return (
+    <div className="space-y-2">
+      {rows.map((row, i)=> (
+        <div key={i} className={i%2===1? "flex gap-3 pl-8" : "flex gap-3"}>
+          {row.map(u=> (
+            <div key={u.id} className="relative">
+              <button onClick={()=>onTap(u)} className="block"><img src={u.avatarUrl} className="w-20 h-20 rounded-full object-cover border-4 border-white shadow -mb-2"/></button>
+              <div className="bg-white rounded-xl shadow px-3 py-2 text-center">
+                <div className="text-sm font-semibold truncate w-24">{u.name}</div>
+                <div className="text-[10px] text-gray-500 truncate w-24">近くにいます</div>
+                <div className="mt-1 flex justify-center"><button onClick={()=>onOpenProfile(u)} className="text-[11px] underline">プロフィール</button></div>
+              </div>
+            </div>
+          ))}
+        </div>
+      ))}
+    </div>
+  );
+};
+
+/********************* チャット *************************/
+const ChatPage: React.FC<{ otherId: UserID }> = ({ otherId }) => {
+  const { users, meId, dms, getDM, sendDM } = useApp();
+  const { navigate } = useRouter();
+  const me = users.find(u=>u.id===meId) as UserT;
+  const other = users.find(u=>u.id===otherId) as UserT;
+  const dmId = getDM(me.id, other.id);
+  const dm = dms.find(x=>x.id===dmId) as DM;
+  const [msg, setMsg] = useState("");
+  const send = () => { if (!msg.trim()) return; sendDM(other.id, me.id, msg.trim()); setMsg(""); };
+  return (
+    <div className="space-y-3">
+      <div className="flex items中心 gap-2 px-1">
+        <button onClick={() => navigate({ name: "friends" })} className="p-2 rounded-full hover:bg-gray-50"><ArrowLeft className="w-5 h-5"/></button>
+        <SectionTitle title={`${other.name} とのチャット`} />
+      </div>
+      <Card className="p-0">
+        <div className="max-h-[50vh] overflow-auto p-3 space-y-2">
+          {dm.messages.map(m => (
+            <div key={m.id} className={m.from===me.id? 'flex justify-end' : 'flex justify-start'}>
+              <div className={m.from===me.id? 'px-3 py-2 rounded-2xl bg-black text-white' : 'px-3 py-2 rounded-2xl bg-gray-100'}>{m.text}</div>
+            </div>
+          ))}
+        </div>
+        <div className="border-t p-2 flex gap-2">
+          <input value={msg} onChange={e=>setMsg(e.target.value)} placeholder="メッセージ" className="flex-1 p-2 rounded-xl border"/>
+          <button onClick={send} className="px-3 py-1.5 rounded-full bg-black text-white text-sm">送信</button>
+        </div>
+      </Card>
+    </div>
+  );
+};
+
+/********************* 設定 *************************/
+const SettingsPage: React.FC = () => {
+  return (
+    <div className="space-y-3">
+      <SectionTitle title="設定" />
+      <Card className="p-4 text-sm text-gray-600">各種設定（ダミー）</Card>
+    </div>
+  );
+};
+
+/********************* 投稿詳細 *************************/
+const PostDetail: React.FC<{ postId: PostID }> = ({ postId }) => {
+  const { posts, users } = useApp();
+  const { navigate } = useRouter();
+  const p = posts.find(x=>x.id===postId) as PostT;
+  const author = users.find(u=>u.id===p.authorId) as UserT;
+  return (
+    <div className="space-y-3">
+      <div className="flex items-center gap-2 px-1">
+        <button onClick={() => navigate({ name: "home" })} className="p-2 rounded-full hover:bg-gray-50"><ArrowLeft className="w-5 h-5"/></button>
+        <SectionTitle title="投稿" />
+      </div>
+      <Card className="p-4">
+        <div className="flex gap-3">
+          <Avatar user={author} onClick={() => navigate({ name: "profile", userId: author.id })} />
+          <div className="flex-1">
+            <div className="flex items-center gap-2">
+              <button className="font-semibold hover:underline" onClick={() => navigate({ name: "profile", userId: author.id })}>{author.name}</button>
+              <span className="text-xs text-gray-500">{author.handle}</span>
+              <span className="text-[10px] px-2 py-0.5 rounded-full border ml-auto">{p.kind}</span>
+            </div>
+            <p className="mt-1 whitespace-pre-wrap">{p.text}</p>
+          </div>
+        </div>
+      </Card>
+    </div>
+  );
+};
+
+/********************* ルート *************************/
+const RouteView: React.FC = () => {
+  const { route } = useRouter();
+  if (route.name === "home") return <Home />;
+  if (route.name === "profile") return <ProfilePage userId={route.userId} />;
+  if (route.name === "friends") return <FriendsPage />;
+  if (route.name === "settings") return <SettingsPage />;
+  if (route.name === "post") return <PostDetail postId={route.postId} />;
+  if (route.name === "chat") return <ChatPage otherId={route.otherId} />;
+  return null;
+};
+
+/********************* ルートエクスポート *************************/
+export default function App() {
+  const app = useAppModel();
+  const [route, setRoute] = useState<Route>({ name: "home" });
+  const navigate = useCallback((r: Route) => setRoute(r), []);
+  return (
+    <AppCtx.Provider value={app}>
+      <RouterCtx.Provider value={{ route, navigate }}>
+        <AuthGate />
+      </RouterCtx.Provider>
+    </AppCtx.Provider>
+  );
+}
